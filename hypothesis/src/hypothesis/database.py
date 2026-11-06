@@ -17,7 +17,8 @@ import sys
 import tempfile
 import warnings
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from hashlib import sha384
@@ -40,14 +41,18 @@ from hypothesis.errors import HypothesisException, HypothesisWarning
 from hypothesis.internal.conjecture.choice import ChoiceT
 from hypothesis.utils.conventions import UniqueIdentifier, not_set
 from hypothesis.utils.deprecation import note_deprecation
+from hypothesis.utils.dynamicvariables import DynamicVariable
 
 __all__ = [
+    "DatabaseView",
+    "DatabaseViewScope",
     "DirectoryBasedExampleDatabase",
     "ExampleDatabase",
     "GitHubArtifactDatabase",
     "InMemoryExampleDatabase",
     "MultiplexedDatabase",
     "ReadOnlyDatabase",
+    "database_view_isolation",
 ]
 
 if TYPE_CHECKING:
@@ -228,6 +233,14 @@ class ExampleDatabase(metaclass=_EDMeta):
 
     def __init__(self) -> None:
         self._listeners: list[ListenerT] = []
+        # Relays attached by DatabaseView instances. These are kept apart from
+        # _listeners so that public listener management (add_listener,
+        # remove_listener, clear_listeners) cannot detach or silence a view
+        # that was bound earlier.
+        self._view_listeners: list[ListenerT] = []
+
+    def _has_listeners(self) -> bool:
+        return bool(self._listeners or self._view_listeners)
 
     @abc.abstractmethod
     def save(self, key: bytes, value: bytes) -> None:
@@ -285,7 +298,7 @@ class ExampleDatabase(metaclass=_EDMeta):
         the database knows that a deletion has occurred in ``key``, but does not
         know what value was deleted.
         """
-        had_listeners = bool(self._listeners)
+        had_listeners = self._has_listeners()
         self._listeners.append(f)
         if not had_listeners:
             self._start_listening()
@@ -299,14 +312,29 @@ class ExampleDatabase(metaclass=_EDMeta):
         if f not in self._listeners:
             return
         self._listeners.remove(f)
-        if not self._listeners:
+        if not self._has_listeners():
             self._stop_listening()
 
     def clear_listeners(self) -> None:
         """Remove all change listeners."""
         had_listeners = bool(self._listeners)
         self._listeners.clear()
-        if had_listeners:
+        # View relays keep the underlying listening carrier alive; only stop
+        # it once nothing at all remains attached.
+        if had_listeners and not self._has_listeners():
+            self._stop_listening()
+
+    def _attach_view_listener(self, f: ListenerT) -> None:
+        had_listeners = self._has_listeners()
+        self._view_listeners.append(f)
+        if not had_listeners:
+            self._start_listening()
+
+    def _detach_view_listener(self, f: ListenerT) -> None:
+        if f not in self._view_listeners:
+            return
+        self._view_listeners.remove(f)
+        if not self._has_listeners():
             self._stop_listening()
 
     def _broadcast_change(self, event: ListenerEventT) -> None:
@@ -327,7 +355,7 @@ class ExampleDatabase(metaclass=_EDMeta):
         from the directory, even if that database was not responsible for
         changing the file.
         """
-        for listener in self._listeners:
+        for listener in [*self._listeners, *self._view_listeners]:
             listener(event)
 
     def _start_listening(self) -> None:
@@ -1228,6 +1256,119 @@ class BackgroundWriteDatabase(ExampleDatabase):
 
     def _stop_listening(self) -> None:
         self._db.remove_listener(self._broadcast_change)
+
+
+class DatabaseView(ExampleDatabase):
+    """An isolated, fixed view of an |ExampleDatabase|.
+
+    A view pins the database instance it was created from: every ``fetch``,
+    ``save``, ``delete``, and ``move`` is delegated to that instance, even if
+    the settings which produced the view later point at a different database
+    or stack additional wrappers around the same instance.
+
+    Listeners added to the view are carried by a private relay on the pinned
+    database, in its ``_view_listeners`` registry. Public listener management
+    on the database (|ExampleDatabase.add_listener|,
+    |ExampleDatabase.remove_listener|, |ExampleDatabase.clear_listeners|) only
+    touches its own listeners and therefore cannot detach or silence a bound
+    view. The distinct write and listening semantics of the pinned database
+    (synchronous or post-hoc broadcast, read-only swallowing, multiplexed
+    fan-out, or backgrounded commits) are preserved unchanged.
+    """
+
+    def __init__(self, db: ExampleDatabase, scope: "DatabaseViewScope") -> None:
+        super().__init__()
+        self._db = db
+        self._scope = scope
+        self._generation = scope.generation
+        self._relay: ListenerT = self._broadcast_change
+
+    def __repr__(self) -> str:
+        return f"DatabaseView({self._db!r}, generation={self._generation})"
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        yield from self._db.fetch(key)
+
+    def save(self, key: bytes, value: bytes) -> None:
+        self._db.save(key, value)
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        self._db.delete(key, value)
+
+    def move(self, src: bytes, dest: bytes, value: bytes) -> None:
+        self._db.move(src, dest, value)
+
+    def _start_listening(self) -> None:
+        self._db._attach_view_listener(self._relay)
+
+    def _stop_listening(self) -> None:
+        self._db._detach_view_listener(self._relay)
+
+
+class DatabaseViewScope:
+    """Host-level isolation for database bindings and listener views.
+
+    A scope hands out one :class:`DatabaseView` per database instance per
+    generation via :meth:`bind`. Views handed out before an :meth:`advance`
+    keep pinning their original database instance and listener view; advancing
+    drops all current bindings so that subsequent binds create fresh views
+    against the then-current databases, without writing through any binding or
+    engine session that was already in flight.
+    """
+
+    def __init__(self) -> None:
+        self.generation: int = 0
+        self._bindings: dict[tuple[int, int], DatabaseView] = {}
+
+    def bind(self, db: ExampleDatabase | None) -> DatabaseView | None:
+        if db is None:
+            return None
+        key = (self.generation, id(db))
+        try:
+            return self._bindings[key]
+        except KeyError:
+            view = DatabaseView(db, self)
+            self._bindings[key] = view
+            return view
+
+    def advance(self) -> None:
+        self.generation += 1
+        self._bindings = {}
+
+
+_current_database_view_scope: DynamicVariable[DatabaseViewScope | None] = (
+    DynamicVariable(None)
+)
+
+
+def bind_database_view(db: ExampleDatabase | None) -> DatabaseView | None:
+    """Bind ``db`` in the currently active view scope, if one is active.
+
+    Returns ``None`` when no :func:`database_view_isolation` scope is active,
+    leaving callers on their pin behavior.
+    """
+    scope = _current_database_view_scope.value
+    if scope is None:
+        return None
+    return scope.bind(db)
+
+
+@contextmanager
+def database_view_isolation() -> Generator[DatabaseViewScope, None, None]:
+    """Enable host-level example database corpus and listener view isolation.
+
+    Within the context, database bindings made through
+    :func:`bind_database_view` pin the database instance and listener view
+    observed at bind time. Advancing the yielded :class:`DatabaseViewScope`
+    freezes existing bindings and engine sessions: they keep operating on their
+    originally bound database instances and cannot be written through by a
+    later database swap, wrapper stacking, or listener-set change. Only binds
+    and engine sessions started after the advance take effect under the new
+    view. Outside of this context everything behaves exactly as without it.
+    """
+    scope = DatabaseViewScope()
+    with _current_database_view_scope.with_value(scope):
+        yield scope
 
 
 def _pack_uleb128(value: int) -> bytes:

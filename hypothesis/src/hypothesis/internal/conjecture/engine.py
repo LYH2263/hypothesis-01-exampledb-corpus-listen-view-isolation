@@ -23,7 +23,13 @@ from typing import Literal, NoReturn, NotRequired, TypedDict, cast
 
 from hypothesis import HealthCheck, Phase, Verbosity, settings as Settings
 from hypothesis._settings import local_settings
-from hypothesis.database import ExampleDatabase, choices_from_bytes, choices_to_bytes
+from hypothesis.database import (
+    DatabaseView,
+    ExampleDatabase,
+    bind_database_view,
+    choices_from_bytes,
+    choices_to_bytes,
+)
 from hypothesis.errors import (
     BackendCannotProceed,
     FlakyBackendFailure,
@@ -307,6 +313,16 @@ class ConjectureRunner:
         self.overrun_test_cases: int = 0
         self.random: Random = random or Random(_random.getrandbits(128))
         self.database_key: bytes | None = database_key
+        # When database view isolation is active, this engine session pins its
+        # own view of settings.database at construction. All corpus commits
+        # (primary-key saves, secondary-key downgrade moves, and pareto-key
+        # saves/deletes) then go through that view, so later database swaps,
+        # wrapper stacking, or listener-set changes cannot write through the
+        # running session. Without an active scope this is None and every
+        # access falls back to the live settings.database, as on the pin.
+        self._database_view: DatabaseView | None = bind_database_view(
+            self.settings.database
+        )
         self.ignore_limits: bool = ignore_limits
         self.thread_overlap = {} if thread_overlap is None else thread_overlap
 
@@ -803,7 +819,7 @@ class ConjectureRunner:
         self.record_for_health_check(data)
 
     def on_pareto_evict(self, data: ConjectureResult) -> None:
-        db = self.settings.database
+        db = self.database
         assert db is not None
 
         db.delete(self.pareto_key, choices_to_bytes(data.choices))
@@ -954,8 +970,9 @@ class ConjectureRunner:
 
     def downgrade_choices(self, choices: Sequence[ChoiceT]) -> None:
         buffer = choices_to_bytes(choices)
-        if self.settings.database is not None and self.database_key is not None:
-            self.settings.database.move(self.database_key, self.secondary_key, buffer)
+        db = self.database
+        if db is not None and self.database_key is not None:
+            db.move(self.database_key, self.secondary_key, buffer)
 
     def sub_key(self, sub_key: bytes | None) -> bytes:
         assert self.database_key is not None
@@ -1029,6 +1046,8 @@ class ConjectureRunner:
     def database(self) -> ExampleDatabase | None:
         if self.database_key is None:
             return None
+        if self._database_view is not None:
+            return self._database_view
         return self.settings.database
 
     def has_existing_test_cases(self) -> bool:
@@ -1059,7 +1078,7 @@ class ConjectureRunner:
             # interesting test cases, but there are a lot of them, so we down
             # sample the secondary corpus to a more manageable size.
 
-            db = self.settings.database
+            db = self.database
             db_key = self.database_key
             assert db is not None
             assert db_key is not None
@@ -1741,7 +1760,7 @@ class ConjectureRunner:
             # probably won't, but it's worth a shot and gives us a good
             # opportunity to clear out the database.
 
-            db = self.settings.database
+            db = self.database
             assert db is not None
 
             # It's not worth trying the primary corpus because we already
